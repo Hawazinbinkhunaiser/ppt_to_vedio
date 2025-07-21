@@ -1,6 +1,6 @@
 streamlit
-moviepy==1.0.3
+moviepy
 pdf2image
-Pillow==9.5.0
-python-3.10
+Pillow
+python
 
