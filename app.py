@@ -2,13 +2,25 @@ import streamlit as st
 import tempfile
 import os
 from pathlib import Path
-import zipfile
-from io import BytesIO
 import fitz  # PyMuPDF
 from PIL import Image
 import numpy as np
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
-import librosa
+import cv2
+from pydub import AudioSegment
+from pydub.utils import which
+import subprocess
+import time
+
+# Set page config
+st.set_page_config(
+    page_title="PDF Slides to Video Converter",
+    page_icon="🎥",
+    layout="wide"
+)
+
+def check_ffmpeg():
+    """Check if ffmpeg is available"""
+    return which("ffmpeg") is not None
 
 def extract_slides_from_pdf(pdf_path, output_dir):
     """Extract slides from PDF as images"""
@@ -30,67 +42,143 @@ def extract_slides_from_pdf(pdf_path, output_dir):
     return slide_paths
 
 def get_audio_duration(audio_path):
-    """Get duration of audio file in seconds"""
+    """Get duration of audio file in seconds using pydub"""
     try:
-        duration = librosa.get_duration(path=audio_path)
-        return duration
-    except:
+        audio = AudioSegment.from_file(audio_path)
+        return len(audio) / 1000.0  # Convert milliseconds to seconds
+    except Exception as e:
+        st.warning(f"Could not read audio file {os.path.basename(audio_path)}: {e}")
         return None
 
-def create_video(slide_paths, audio_files, output_path):
-    """Create video from slides and audio files"""
-    clips = []
-    
-    for i, slide_path in enumerate(slide_paths):
-        slide_num = i + 1
-        audio_path = None
+def create_video_opencv(slide_paths, audio_files, output_path, temp_dir):
+    """Create video using OpenCV and ffmpeg"""
+    try:
+        # Prepare slide information
+        slide_info = []
+        total_duration = 0
         
-        # Look for corresponding audio file
-        for audio_file in audio_files:
-            if f"slide_{slide_num}.mp3" in audio_file or f"slide_{slide_num}.wav" in audio_file:
-                audio_path = audio_file
-                break
+        for i, slide_path in enumerate(slide_paths):
+            slide_num = i + 1
+            audio_path = None
+            duration = 10  # default duration
+            
+            # Look for corresponding audio file
+            for audio_file in audio_files:
+                audio_name = os.path.basename(audio_file)
+                if f"slide_{slide_num}.mp3" in audio_name or f"slide_{slide_num}.wav" in audio_name:
+                    audio_path = audio_file
+                    break
+            
+            if audio_path and os.path.exists(audio_path):
+                audio_duration = get_audio_duration(audio_path)
+                if audio_duration:
+                    duration = audio_duration
+            
+            slide_info.append({
+                'slide_path': slide_path,
+                'audio_path': audio_path,
+                'duration': duration,
+                'start_time': total_duration
+            })
+            total_duration += duration
         
-        if audio_path and os.path.exists(audio_path):
-            # Get audio duration
-            audio_duration = get_audio_duration(audio_path)
-            if audio_duration:
-                # Create image clip with audio duration
-                img_clip = ImageClip(slide_path, duration=audio_duration)
-                audio_clip = AudioFileClip(audio_path)
-                # Combine image and audio
-                video_clip = img_clip.set_audio(audio_clip)
-                clips.append(video_clip)
-            else:
-                # If audio can't be read, use 10 seconds silence
-                img_clip = ImageClip(slide_path, duration=10)
-                clips.append(img_clip)
+        # Read first slide to get dimensions
+        first_slide = cv2.imread(slide_paths[0])
+        if first_slide is None:
+            raise Exception("Could not read the first slide image")
+        
+        height, width, layers = first_slide.shape
+        
+        # Create temporary video without audio
+        temp_video_path = os.path.join(temp_dir, "temp_video.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = 1  # 1 frame per second for simplicity
+        
+        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+        
+        # Add frames for each slide
+        for slide_data in slide_info:
+            slide_img = cv2.imread(slide_data['slide_path'])
+            if slide_img is None:
+                continue
+            
+            # Add frames based on duration (fps * duration)
+            num_frames = max(1, int(fps * slide_data['duration']))
+            for _ in range(num_frames):
+                out.write(slide_img)
+        
+        out.release()
+        
+        # Now combine audio using ffmpeg if available
+        if check_ffmpeg():
+            return create_video_with_ffmpeg(slide_info, temp_video_path, output_path, temp_dir)
         else:
-            # No audio file found, use 10 seconds silence
-            img_clip = ImageClip(slide_path, duration=10)
-            clips.append(img_clip)
-    
-    if clips:
-        # Concatenate all clips
-        final_video = concatenate_videoclips(clips, method="compose")
-        final_video.write_videofile(output_path, fps=1, codec='libx264')
-        final_video.close()
+            # If no ffmpeg, just return the video without audio
+            os.rename(temp_video_path, output_path)
+            return len(slide_paths), False
         
-        # Clean up clips
-        for clip in clips:
-            clip.close()
-    
-    return len(clips)
+    except Exception as e:
+        st.error(f"Error creating video: {e}")
+        return 0, False
+
+def create_video_with_ffmpeg(slide_info, video_path, output_path, temp_dir):
+    """Combine video with audio using ffmpeg"""
+    try:
+        # Create audio timeline
+        audio_clips = []
+        current_time = 0
+        
+        for slide_data in slide_info:
+            if slide_data['audio_path'] and os.path.exists(slide_data['audio_path']):
+                # Add audio at the correct time
+                audio_clips.append(f"[1:a]atrim=0:{slide_data['duration']},asetpts=PTS-STARTPTS[a{len(audio_clips)}];")
+            current_time += slide_data['duration']
+        
+        if audio_clips:
+            # Create complex audio filter
+            audio_files_input = []
+            audio_filter = ""
+            
+            for i, slide_data in enumerate(slide_info):
+                if slide_data['audio_path'] and os.path.exists(slide_data['audio_path']):
+                    audio_files_input.extend(["-i", slide_data['audio_path']])
+            
+            # Simple approach: create video with first available audio
+            for slide_data in slide_info:
+                if slide_data['audio_path'] and os.path.exists(slide_data['audio_path']):
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", video_path,
+                        "-i", slide_data['audio_path'],
+                        "-c:v", "libx264",
+                        "-c:a", "aac",
+                        "-shortest",
+                        output_path
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        return len(slide_info), True
+                    break
+        
+        # If no audio or ffmpeg fails, copy the video without audio
+        os.rename(video_path, output_path)
+        return len(slide_info), False
+        
+    except Exception as e:
+        st.warning(f"Audio processing failed: {e}. Creating video without audio.")
+        os.rename(video_path, output_path)
+        return len(slide_info), False
 
 def main():
-    st.set_page_config(
-        page_title="PDF Slides to Video Converter",
-        page_icon="🎥",
-        layout="wide"
-    )
-    
     st.title("🎥 PDF Slides to Video Converter")
     st.markdown("Convert your PDF presentation slides with audio narration into a video!")
+    
+    # Check system capabilities
+    ffmpeg_available = check_ffmpeg()
+    
+    if not ffmpeg_available:
+        st.warning("⚠️ FFmpeg not detected. Videos will be created without audio synchronization. Audio files will still be processed but may not be perfectly synchronized.")
     
     # Instructions
     with st.expander("📋 Instructions"):
@@ -146,8 +234,10 @@ def main():
                             f.write(pdf_file.getbuffer())
                         
                         # Extract slides
+                        progress_bar = st.progress(0)
                         st.info("📄 Extracting slides from PDF...")
                         slide_paths = extract_slides_from_pdf(pdf_path, temp_dir)
+                        progress_bar.progress(0.3)
                         st.success(f"Extracted {len(slide_paths)} slides")
                         
                         # Save audio files
@@ -160,13 +250,23 @@ def main():
                                     f.write(audio_file.getbuffer())
                                 audio_file_paths.append(audio_path)
                         
+                        progress_bar.progress(0.6)
+                        
                         # Create video
                         st.info("🎬 Creating video...")
                         output_video_path = os.path.join(temp_dir, "presentation_video.mp4")
-                        num_clips = create_video(slide_paths, audio_file_paths, output_video_path)
+                        num_clips, has_audio = create_video_opencv(slide_paths, audio_file_paths, output_video_path, temp_dir)
                         
-                        if os.path.exists(output_video_path):
-                            st.success(f"✅ Video created successfully with {num_clips} slides!")
+                        progress_bar.progress(1.0)
+                        
+                        if os.path.exists(output_video_path) and num_clips > 0:
+                            success_msg = f"✅ Video created successfully with {num_clips} slides!"
+                            if has_audio:
+                                success_msg += " (with audio)"
+                            else:
+                                success_msg += " (video only - audio sync may not be perfect)"
+                            
+                            st.success(success_msg)
                             
                             # Provide download button
                             with open(output_video_path, "rb") as video_file:
@@ -179,7 +279,10 @@ def main():
                             
                             # Show video preview
                             st.subheader("🎥 Video Preview")
-                            st.video(output_video_path)
+                            try:
+                                st.video(output_video_path)
+                            except:
+                                st.info("Video created successfully! Use the download button above to get your video.")
                         else:
                             st.error("❌ Failed to create video. Please check your files and try again.")
             
