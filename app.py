@@ -31,13 +31,15 @@ if pdf_file and audio_files:
 
         for idx, img in enumerate(slide_images, start=1):
             image_path = os.path.join(tmpdir, f"slide_{idx}.png")
+
+            # Manually resize using PIL before giving to MoviePy
             img = img.resize((1280, 720), Image.Resampling.LANCZOS)
             img.save(image_path, "PNG")
 
             audio_filename = f"slide_{idx}.mp3"
             audio_path = audio_map.get(audio_filename.lower())
 
-            # Use real audio if available, else 10-second silent clip
+            # Use real audio if available, else 10s silent fallback
             if audio_path:
                 try:
                     audio = AudioFileClip(audio_path)
@@ -51,11 +53,11 @@ if pdf_file and audio_files:
                 audio = AudioClip(lambda t: np.zeros_like(t), duration=duration, fps=44100)
                 errors.append(f"Missing audio: {audio_filename}")
 
+            # Now no need to use .resize() in MoviePy
             clip = (
                 ImageClip(image_path)
                 .set_duration(duration)
                 .set_audio(audio)
-                .resize(height=720)
             )
             clips.append(clip)
 
