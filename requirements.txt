@@ -1,4 +1,4 @@
 streamlit
-pdf2image
 moviepy
+pdf2image
 Pillow
